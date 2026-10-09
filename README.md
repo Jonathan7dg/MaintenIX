@@ -1,10 +1,11 @@
-# MaintenIX — prototipo funcional en Flask + SQLite
+# MaintenIX — prototipo funcional en Flask + PostgreSQL (Supabase)
 
-Aplicación web local para gestión de mantenimiento de Mi Ropa Favorita.
+Aplicación web para gestión de mantenimiento de Mi Ropa Favorita.
 
 ## Requisitos
 - Python 3.10 o superior
 - Navegador moderno
+- Una base de datos PostgreSQL (se usa un proyecto de Supabase) y la variable de entorno `DATABASE_URL`
 
 ## Ejecutar en Windows
 1. Extraé la carpeta del ZIP.
@@ -22,18 +23,17 @@ chmod +x run_mac_linux.sh
 ```
 Luego abrí http://127.0.0.1:5000.
 
-## Desplegar en Render
+## Desplegar en Render (plan free)
 1. Subí este repositorio a GitHub.
-2. En Render, creá un **Blueprint** (New > Blueprint) y apuntá al repo; Render leerá `render.yaml`.
-   - Alternativa manual: New > Web Service, *Runtime* Python, *Build Command* `pip install -r requirements.txt`, *Start Command* `gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120`.
-3. Variables de entorno recomendadas:
-   - `MAINTENIX_SECRET_KEY`: clave secreta (Render puede generarla).
-   - `MAINTENIX_DATA_DIR`: carpeta persistente para la base de datos y evidencias (por defecto `instance`).
-4. El `render.yaml` monta un disco persistente en `/var/data` y apunta `MAINTENIX_DATA_DIR` ahí, para que la base SQLite y las evidencias sobrevivan a los despliegues.
+2. En Render, creá un **Blueprint** (New > Blueprint) y apuntá al repo; Render leerá `render.yaml` (plan **free**, sin disco).
+3. Variables de entorno (Render las pide al aplicar el Blueprint):
+   - `DATABASE_URL`: cadena de conexión de Supabase (Dashboard → Project Settings → Database → Connection string → **URI**). **Requerida.**
+   - `MAINTENIX_SECRET_KEY`: Render la genera automáticamente.
+4. Build `pip install -r requirements.txt`; Start `gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120`.
 
-> Los **discos persistentes requieren un plan pago** (Starter o superior). En el plan *free* el sistema de archivos es efímero: la base y las evidencias se borran en cada deploy/reinicio. Para usar el plan gratis, quitá el bloque `disk` de `render.yaml` y la variable `MAINTENIX_DATA_DIR`, asumiendo que los datos no persisten.
-
-> Esta app usa SQLite con 1 worker de gunicorn; no escales el servicio a varias instancias ni subas el número de workers.
+> La base de datos es **PostgreSQL de Supabase**, así que los datos sobreviven a los redeploys y al *spin-down* del plan free de Render. Las **evidencias** (archivos subidos) se guardan en el disco efímero de Render y se pierden en cada deploy/reinicio.
+>
+> Esta app usa 1 worker de gunicorn; no escales el servicio a varias instancias.
 
 ## Cuenta inicial
 - Correo: `admin@maintenix.local`
@@ -55,10 +55,10 @@ Luego abrí http://127.0.0.1:5000.
 - Datos de demostración opcionales; incluyen una máquina Sambo marcada como crítica, con especificaciones por confirmar.
 
 ## Persistencia y copias
-La base de datos local se guarda en `instance/maintenix.db`. Las evidencias se guardan en `instance/uploads/`. Para hacer una copia de seguridad, cerrá la aplicación y copiá la carpeta `instance`.
+Los datos se guardan en **PostgreSQL (Supabase)**, indicado por la variable `DATABASE_URL`. Las evidencias subidas se guardan en `instance/uploads/` (local/efímero). Para respaldar la base usá el panel de Supabase (Database → Backups) o `pg_dump "$DATABASE_URL" > backup.sql`.
 
 ## Limitaciones conocidas de esta primera versión
-- La aplicación funciona localmente en una computadora; SQLite no está preparada para múltiples servidores simultáneos.
+- La aplicación usa PostgreSQL; configurá `DATABASE_URL` antes de correrla.
 - La subida de evidencias es almacenamiento local, no almacenamiento en nube.
 - Las notificaciones por correo no están activadas; requiere configurar un proveedor SMTP y credenciales.
 - No incluye todavía exportación a Excel/PDF, importación desde Excel ni registro de lecturas periódicas de horas de operación.

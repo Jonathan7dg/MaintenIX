@@ -7,3 +7,4 @@ server_err.log
 instance/*.db
 instance/uploads/
 .env
+*credenciales*.txt
