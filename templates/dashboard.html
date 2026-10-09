@@ -1,0 +1,29 @@
+{% extends "base.html" %}{% block title %}Dashboard{% endblock %}{% block top_title %}Dashboard de mantenimiento{% endblock %}{% block content %}
+<div class="page-head"><div><h1>Buenos días, {{ current_user.full_name.split()[0] }} 👋</h1><p>Resumen de la operación y estado del mantenimiento para {{ settings.get('company_name','Mi Ropa Favorita') }}.</p></div><div class="actions"><a class="btn secondary" href="{{ url_for('reports') }}">Ver reportes</a><a class="btn" href="{{ url_for('work_order_new') }}">＋ Nueva orden</a></div></div>
+{% if settings.get('demo_mode')=='1' %}<div class="notice warning"><strong>Modo de demostración.</strong> Los datos de ejemplo deben revisarse y no representan mediciones reales de la empresa.</div>{% endif %}
+<div class="grid stats">
+<div class="stat"><div class="stat-top">Máquinas registradas <span class="stat-icon">⚙</span></div><div class="stat-value">{{ equipment_count }}</div><div class="stat-note">Equipos en el inventario</div></div>
+<div class="stat"><div class="stat-top">Órdenes abiertas <span class="stat-icon">▤</span></div><div class="stat-value">{{ open_orders }}</div><div class="stat-note">Pendientes de cierre</div></div>
+<div class="stat"><div class="stat-top">Mantenimientos vencidos <span class="stat-icon">◷</span></div><div class="stat-value">{{ overdue }}</div><div class="stat-note">Requieren atención</div></div>
+<div class="stat"><div class="stat-top">Horas de parada <span class="stat-icon">Ⅱ</span></div><div class="stat-value">{{ '%.1f'|format(downtime) }} <span style="font-size:13px">h</span></div><div class="stat-note">Órdenes creadas este mes</div></div>
+</div>
+<div class="grid dashboard-grid">
+<div>
+<div class="panel"><div class="panel-head"><div><h2>Fallas por máquina</h2><div class="panel-sub">Órdenes correctivas registradas</div></div><a href="{{ url_for('reports') }}">Ver detalle ↗</a></div>
+{% if failures and failures|sum(attribute='total')>0 %}<div class="failure-list">{% set maxf=failures|map(attribute='total')|max %}{% for e in failures if e.total>0 %}<div class="failure-row"><div><div class="failure-name">{{ e.code }} · {{ e.name }}</div><div class="bar"><span style="width:{{ (e.total/maxf*100) if maxf else 0 }}%"></span></div></div><div class="bar-count">{{ e.total }}</div></div>{% endfor %}</div>{% else %}<div class="empty">Todavía no hay fallas correctivas registradas. ¡Buen momento para cargar el inventario!</div>{% endif %}</div>
+<div class="panel"><div class="panel-head"><div><h2>Órdenes recientes</h2><div class="panel-sub">Últimos movimientos de mantenimiento</div></div><a href="{{ url_for('work_orders') }}">Ver todas ↗</a></div><div class="table-wrap"><table><thead><tr><th>Orden</th><th>Máquina</th><th>Tipo</th><th>Estado</th></tr></thead><tbody>{% for o in recent %}<tr><td><a class="primary-text" href="{{ url_for('work_order_detail',order_id=o.id) }}">{{ o.order_code }}</a></td><td>{{ o.code }}<br><span class="muted">{{ o.name }}</span></td><td>{{ o.maintenance_type }}</td><td><span class="badge {% if o.status=='Cerrada' %}green{% elif o.status=='En proceso' %}orange{% elif o.status=='Pendiente' %}red{% endif %}">{{ o.status }}</span></td></tr>{% else %}<tr><td colspan="4" class="empty">No hay órdenes todavía.</td></tr>{% endfor %}</tbody></table></div></div>
+</div>
+<div>
+<div class="panel"><div class="panel-head"><div><h2>Indicadores del mes</h2><div class="panel-sub">{{ now if now else 'Período actual' }}</div></div><span class="badge">Mensual</span></div>
+<div class="metric-row"><span>MTBF · Tiempo entre fallas</span><strong>{{ '%.1f'|format(mtbf) }} h</strong></div>
+<div class="metric-row"><span>MTTR · Tiempo de reparación</span><strong>{{ '%.1f'|format(mttr) }} h</strong></div>
+<div class="metric-row"><span>Mantenimiento correctivo</span><strong>{{ '%.1f'|format(corrective_pct) }}%</strong></div>
+<div class="metric-row"><span>Costos registrados</span><strong>{{ currency_symbol }} {{ costs|money }}</strong></div>
+<div class="metric-row"><span>Preventivos cerrados</span><strong>{{ preventive_closed }} / {{ preventive_total }}</strong></div>
+<div class="footer-note">MTBF se estima con intervalos entre órdenes correctivas registradas. Para disponibilidad operacional confiable, registrá el tiempo planificado de operación y las paradas de cada equipo.</div></div>
+<div class="panel"><div class="panel-head"><div><h2>Metas configuradas</h2><div class="panel-sub">Objetivos definidos por el encargado</div></div>{% if current_user.role=='Encargado de mantenimiento' %}<a href="{{ url_for('settings_page') }}">Editar</a>{% endif %}</div>
+<div class="metric-row"><span>Disponibilidad operacional</span><strong>{{ goals.get('availability').target if goals.get('availability') else 95 }}%</strong></div>
+<div class="metric-row"><span>Cumplimiento preventivo</span><strong>{{ goals.get('preventive_compliance').target if goals.get('preventive_compliance') else 90 }}%</strong></div>
+<div class="metric-row"><span>Correctivo máximo</span><strong>{{ goals.get('corrective_percentage').target if goals.get('corrective_percentage') else 20 }}%</strong></div>
+<div class="metric-row"><span>Paradas mensuales</span><strong>{{ goals.get('monthly_downtime').target if goals.get('monthly_downtime') else 10 }} h</strong></div></div>
+</div></div>{% endblock %}

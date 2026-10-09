@@ -1,0 +1,669 @@
+import os
+import sqlite3
+from datetime import datetime, date, timedelta
+from functools import wraps
+from flask import Flask, render_template, request, redirect, url_for, flash, session, g, abort
+from werkzeug.security import generate_password_hash, check_password_hash
+
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+DATA_DIR = os.environ.get("MAINTENIX_DATA_DIR", os.path.join(BASE_DIR, "instance"))
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "maintenix.db")
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("MAINTENIX_SECRET_KEY", "cambia-esta-clave-antes-de-usar-en-produccion")
+app.config["DATABASE"] = DB_PATH
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+
+ROLES = {
+    "Encargado de mantenimiento": "admin",
+    "Técnico de mantenimiento": "technician",
+    "Supervisor de producción": "supervisor",
+}
+EQUIPMENT_TYPES = [
+    "Máquina Sambo", "Máquina de coser industrial", "Máquina de corte",
+    "Plancha industrial", "Overlock", "Collaretera", "Bordadora",
+    "Estampadora / sublimadora", "Caldera / generador de vapor", "Otro"
+]
+MAINTENANCE_TYPES = ["Preventivo", "Correctivo", "Inspección", "Predictivo"]
+ORDER_STATUSES = ["Pendiente", "Asignada", "En proceso", "En revisión", "Cerrada", "Cancelada"]
+PRIORITIES = ["Baja", "Media", "Alta", "Crítica"]
+
+def now_iso():
+    return datetime.now().isoformat(timespec="minutes")
+
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(app.config["DATABASE"])
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
+    return g.db
+
+@app.teardown_appcontext
+def close_db(error=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+def init_db():
+    db = sqlite3.connect(app.config["DATABASE"])
+    db.execute("PRAGMA foreign_keys = ON")
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        full_name TEXT NOT NULL,
+        email TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL,
+        approved INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS equipment (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        equipment_type TEXT NOT NULL,
+        brand TEXT DEFAULT '',
+        model TEXT DEFAULT '',
+        location TEXT NOT NULL DEFAULT '',
+        criticality TEXT NOT NULL DEFAULT 'Media',
+        status TEXT NOT NULL DEFAULT 'Operativa',
+        operating_hours REAL NOT NULL DEFAULT 0,
+        maintenance_interval_days INTEGER,
+        notes TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS work_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_code TEXT NOT NULL UNIQUE,
+        equipment_id INTEGER NOT NULL,
+        maintenance_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        priority TEXT NOT NULL DEFAULT 'Media',
+        status TEXT NOT NULL DEFAULT 'Pendiente',
+        assigned_to INTEGER,
+        reported_by INTEGER,
+        scheduled_date TEXT,
+        started_at TEXT,
+        completed_at TEXT,
+        downtime_start TEXT,
+        downtime_end TEXT,
+        labor_hours REAL NOT NULL DEFAULT 0,
+        labor_cost REAL NOT NULL DEFAULT 0,
+        parts_cost REAL NOT NULL DEFAULT 0,
+        resolution TEXT DEFAULT '',
+        approved_by INTEGER,
+        approved_at TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(equipment_id) REFERENCES equipment(id),
+        FOREIGN KEY(assigned_to) REFERENCES users(id),
+        FOREIGN KEY(reported_by) REFERENCES users(id),
+        FOREIGN KEY(approved_by) REFERENCES users(id)
+    );
+    CREATE TABLE IF NOT EXISTS spare_parts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        equipment_id INTEGER,
+        quantity INTEGER NOT NULL DEFAULT 0,
+        minimum_quantity INTEGER NOT NULL DEFAULT 0,
+        unit_cost REAL NOT NULL DEFAULT 0,
+        location TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(equipment_id) REFERENCES equipment(id)
+    );
+    CREATE TABLE IF NOT EXISTS order_parts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_order_id INTEGER NOT NULL,
+        spare_part_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_cost REAL NOT NULL,
+        FOREIGN KEY(work_order_id) REFERENCES work_orders(id) ON DELETE CASCADE,
+        FOREIGN KEY(spare_part_id) REFERENCES spare_parts(id)
+    );
+    CREATE TABLE IF NOT EXISTS attachments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        work_order_id INTEGER NOT NULL,
+        original_name TEXT NOT NULL,
+        stored_name TEXT NOT NULL,
+        uploaded_by INTEGER,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(work_order_id) REFERENCES work_orders(id) ON DELETE CASCADE,
+        FOREIGN KEY(uploaded_by) REFERENCES users(id)
+    );
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS goals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        metric TEXT NOT NULL UNIQUE,
+        target REAL NOT NULL,
+        unit TEXT NOT NULL DEFAULT ''
+    );
+    """)
+    for key, value in {
+        "company_name": "Mi Ropa Favorita",
+        "currency": "NIO",
+        "timezone": "America/Managua",
+        "demo_mode": "1",
+    }.items():
+        db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
+    for metric, target, unit in [
+        ("availability", 95, "%"), ("preventive_compliance", 90, "%"),
+        ("corrective_percentage", 20, "%"), ("monthly_downtime", 10, "h"),
+    ]:
+        db.execute("INSERT OR IGNORE INTO goals(metric,target,unit) VALUES(?,?,?)", (metric, target, unit))
+    db.commit()
+    # Bootstrap administrator for first-run setup. Change credentials immediately.
+    admin = db.execute("SELECT id FROM users WHERE role='Encargado de mantenimiento'").fetchone()
+    if not admin:
+        db.execute(
+            "INSERT INTO users(full_name,email,password_hash,role,approved,created_at) VALUES(?,?,?,?,?,?)",
+            ("Administrador MaintenIX", "admin@maintenix.local",
+             generate_password_hash("Admin123!"), "Encargado de mantenimiento", 1, now_iso())
+        )
+        db.commit()
+    db.close()
+
+def current_user():
+    if not session.get("user_id"):
+        return None
+    return get_db().execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not current_user():
+            return redirect(url_for("login"))
+        return fn(*args, **kwargs)
+    return wrapper
+
+def roles_required(*roles):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            user = current_user()
+            if not user:
+                return redirect(url_for("login"))
+            if user["role"] not in roles:
+                abort(403)
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+@app.context_processor
+def inject_globals():
+    user = current_user()
+    settings = {}
+    try:
+        settings = {r["key"]: r["value"] for r in get_db().execute("SELECT key,value FROM settings")}
+    except Exception:
+        pass
+    return {"current_user": user, "settings": settings, "roles": ROLES, "currency_symbol": {"NIO":"C$","USD":"US$","EUR":"€"}.get(settings.get("currency","NIO"), settings.get("currency",""))}
+
+@app.template_filter("money")
+def money(value):
+    try:
+        return f"{float(value or 0):,.2f}"
+    except (ValueError, TypeError):
+        return "0.00"
+
+@app.template_filter("dt")
+def dt(value):
+    if not value:
+        return "—"
+    try:
+        return datetime.fromisoformat(value).strftime("%d/%m/%Y %H:%M")
+    except ValueError:
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").strftime("%d/%m/%Y")
+        except ValueError:
+            return value
+
+@app.route("/")
+@login_required
+def dashboard():
+    db = get_db()
+    month = date.today().strftime("%Y-%m")
+    equipment_count = db.execute("SELECT COUNT(*) n FROM equipment").fetchone()["n"]
+    open_orders = db.execute("SELECT COUNT(*) n FROM work_orders WHERE status NOT IN ('Cerrada','Cancelada')").fetchone()["n"]
+    overdue = db.execute("SELECT COUNT(*) n FROM work_orders WHERE scheduled_date < ? AND status NOT IN ('Cerrada','Cancelada')", (date.today().isoformat(),)).fetchone()["n"]
+    month_orders = db.execute("SELECT * FROM work_orders WHERE substr(created_at,1,7)=?", (month,)).fetchall()
+    failures = db.execute("""SELECT e.id,e.code,e.name,COUNT(w.id) AS total
+        FROM equipment e LEFT JOIN work_orders w ON w.equipment_id=e.id AND w.maintenance_type='Correctivo'
+        GROUP BY e.id ORDER BY total DESC,e.name LIMIT 8""").fetchall()
+    recent = db.execute("""SELECT w.*,e.code,e.name,u.full_name AS technician
+        FROM work_orders w JOIN equipment e ON e.id=w.equipment_id
+        LEFT JOIN users u ON u.id=w.assigned_to ORDER BY w.id DESC LIMIT 7""").fetchall()
+    closed = [w for w in month_orders if w["status"] == "Cerrada"]
+    downtime = sum(hours_between(w["downtime_start"], w["downtime_end"]) for w in month_orders)
+    costs = sum(float(w["labor_cost"] or 0) + float(w["parts_cost"] or 0) for w in month_orders)
+    corrective = sum(1 for w in month_orders if w["maintenance_type"] == "Correctivo")
+    corrective_pct = (corrective / len(month_orders) * 100) if month_orders else 0
+    completed_with_times = [w for w in closed if w["started_at"] and w["completed_at"]]
+    mttr = sum(hours_between(w["started_at"], w["completed_at"]) for w in completed_with_times) / len(completed_with_times) if completed_with_times else 0
+    failure_orders = db.execute("""SELECT created_at FROM work_orders WHERE maintenance_type='Correctivo'
+        AND substr(created_at,1,7)=? ORDER BY created_at""", (month,)).fetchall()
+    intervals = []
+    for a,b in zip(failure_orders, failure_orders[1:]):
+        intervals.append(hours_between(a["created_at"], b["created_at"]))
+    mtbf = sum(intervals)/len(intervals) if intervals else 0
+    goals = {r["metric"]: r for r in db.execute("SELECT * FROM goals")}
+    return render_template("dashboard.html", equipment_count=equipment_count, open_orders=open_orders,
+        overdue=overdue, failures=failures, recent=recent, downtime=downtime, costs=costs,
+        corrective_pct=corrective_pct, mttr=mttr, mtbf=mtbf, goals=goals,
+        preventive_total=sum(1 for w in month_orders if w["maintenance_type"]=="Preventivo"),
+        preventive_closed=sum(1 for w in month_orders if w["maintenance_type"]=="Preventivo" and w["status"]=="Cerrada"))
+
+def hours_between(start, end):
+    if not start or not end:
+        return 0
+    try:
+        delta = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+        return max(delta.total_seconds()/3600, 0)
+    except (ValueError, TypeError):
+        return 0
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        name = request.form.get("full_name","").strip()
+        email = request.form.get("email","").strip().lower()
+        password = request.form.get("password","")
+        role = request.form.get("role","")
+        if not name or not email or len(password) < 8 or role not in ("Técnico de mantenimiento", "Supervisor de producción"):
+            flash("Completá todos los campos. La contraseña debe tener al menos 8 caracteres.", "error")
+            return redirect(url_for("register"))
+        try:
+            get_db().execute("INSERT INTO users(full_name,email,password_hash,role,approved,created_at) VALUES(?,?,?,?,0,?)",
+                (name,email,generate_password_hash(password),role,now_iso()))
+            get_db().commit()
+            flash("Solicitud enviada. El encargado debe aprobar tu cuenta antes de iniciar sesión.", "success")
+            return redirect(url_for("login"))
+        except sqlite3.IntegrityError:
+            flash("Ese correo ya está registrado.", "error")
+    return render_template("register.html")
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        email = request.form.get("email","").strip().lower()
+        password = request.form.get("password","")
+        user = get_db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        if not user or not check_password_hash(user["password_hash"], password):
+            flash("Correo o contraseña incorrectos.", "error")
+        elif not user["approved"]:
+            flash("Tu cuenta aún está pendiente de aprobación.", "error")
+        else:
+            session.clear()
+            session["user_id"] = user["id"]
+            return redirect(url_for("dashboard"))
+    return render_template("login.html")
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+@app.route("/equipment")
+@login_required
+def equipment_list():
+    rows = get_db().execute("""SELECT e.*, (SELECT COUNT(*) FROM work_orders w WHERE w.equipment_id=e.id AND w.maintenance_type='Correctivo') failures
+        FROM equipment e ORDER BY e.criticality='Crítica' DESC,e.name""").fetchall()
+    return render_template("equipment.html", equipment=rows)
+
+@app.route("/equipment/new", methods=["GET", "POST"])
+@login_required
+@roles_required("Encargado de mantenimiento")
+def equipment_new():
+    if request.method == "POST":
+        f = request.form
+        code, name = f.get("code","").strip().upper(), f.get("name","").strip()
+        if not code or not name:
+            flash("El código y el nombre son obligatorios.", "error")
+        else:
+            try:
+                get_db().execute("""INSERT INTO equipment(code,name,equipment_type,brand,model,location,criticality,status,operating_hours,maintenance_interval_days,notes,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (code,name,f.get("equipment_type","Otro"),f.get("brand","").strip(),f.get("model","").strip(),
+                     f.get("location","").strip(),f.get("criticality","Media"),f.get("status","Operativa"),
+                     float(f.get("operating_hours") or 0),int(f.get("maintenance_interval_days") or 0) or None,
+                     f.get("notes","").strip(),now_iso()))
+                get_db().commit()
+                flash("Máquina registrada correctamente.", "success")
+                return redirect(url_for("equipment_list"))
+            except sqlite3.IntegrityError:
+                flash("Ya existe una máquina con ese código.", "error")
+    return render_template("equipment_form.html", equipment=None, equipment_types=EQUIPMENT_TYPES)
+
+@app.route("/equipment/<int:equipment_id>/edit", methods=["GET", "POST"])
+@login_required
+@roles_required("Encargado de mantenimiento")
+def equipment_edit(equipment_id):
+    db = get_db()
+    equipment = db.execute("SELECT * FROM equipment WHERE id=?", (equipment_id,)).fetchone()
+    if not equipment:
+        abort(404)
+    if request.method == "POST":
+        f = request.form
+        db.execute("""UPDATE equipment SET code=?,name=?,equipment_type=?,brand=?,model=?,location=?,criticality=?,status=?,operating_hours=?,maintenance_interval_days=?,notes=? WHERE id=?""",
+            (f.get("code","").strip().upper(),f.get("name","").strip(),f.get("equipment_type","Otro"),
+             f.get("brand","").strip(),f.get("model","").strip(),f.get("location","").strip(),
+             f.get("criticality","Media"),f.get("status","Operativa"),float(f.get("operating_hours") or 0),
+             int(f.get("maintenance_interval_days") or 0) or None,f.get("notes","").strip(),equipment_id))
+        db.commit()
+        flash("Ficha de máquina actualizada.", "success")
+        return redirect(url_for("equipment_list"))
+    return render_template("equipment_form.html", equipment=equipment, equipment_types=EQUIPMENT_TYPES)
+
+@app.route("/work-orders")
+@login_required
+def work_orders():
+    status = request.args.get("status","")
+    sql = """SELECT w.*,e.code,e.name,u.full_name AS technician,reporter.full_name AS reporter
+        FROM work_orders w JOIN equipment e ON e.id=w.equipment_id
+        LEFT JOIN users u ON u.id=w.assigned_to LEFT JOIN users reporter ON reporter.id=w.reported_by"""
+    args = []
+    if status:
+        sql += " WHERE w.status=?"
+        args.append(status)
+    sql += " ORDER BY CASE w.priority WHEN 'Crítica' THEN 0 WHEN 'Alta' THEN 1 WHEN 'Media' THEN 2 ELSE 3 END, w.id DESC"
+    rows = get_db().execute(sql,args).fetchall()
+    return render_template("work_orders.html", orders=rows, statuses=ORDER_STATUSES)
+
+@app.route("/work-orders/new", methods=["GET", "POST"])
+@login_required
+def work_order_new():
+    db = get_db()
+    equipment = db.execute("SELECT * FROM equipment ORDER BY name").fetchall()
+    techs = db.execute("SELECT id,full_name FROM users WHERE approved=1 AND role IN ('Encargado de mantenimiento','Técnico de mantenimiento') ORDER BY full_name").fetchall()
+    if not equipment:
+        flash("Primero registrá al menos una máquina.", "error")
+        return redirect(url_for("equipment_list"))
+    if request.method == "POST":
+        f = request.form
+        equipment_id = int(f.get("equipment_id") or 0)
+        eq = db.execute("SELECT * FROM equipment WHERE id=?", (equipment_id,)).fetchone()
+        if not eq:
+            flash("Seleccioná una máquina válida.", "error")
+            return redirect(url_for("work_order_new"))
+        priority = f.get("priority","Media")
+        if eq["criticality"] == "Crítica" and priority in ("Baja","Media"):
+            priority = "Alta"
+        order_code = "OT-" + datetime.now().strftime("%y%m%d%H%M%S")
+        db.execute("""INSERT INTO work_orders(order_code,equipment_id,maintenance_type,title,description,priority,status,assigned_to,reported_by,scheduled_date,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (order_code,equipment_id,f.get("maintenance_type","Correctivo"),f.get("title","").strip(),
+             f.get("description","").strip(),priority,"Pendiente",int(f.get("assigned_to") or 0) or None,
+             session["user_id"],f.get("scheduled_date") or None,now_iso()))
+        if f.get("maintenance_type") == "Correctivo":
+            db.execute("UPDATE equipment SET status='Fuera de servicio' WHERE id=?", (equipment_id,))
+        db.commit()
+        flash(f"Orden {order_code} creada.", "success")
+        return redirect(url_for("work_order_detail", order_id=db.execute("SELECT last_insert_rowid()").fetchone()[0]))
+    return render_template("work_order_form.html", equipment=equipment, technicians=techs, maintenance_types=MAINTENANCE_TYPES, priorities=PRIORITIES)
+
+@app.route("/work-orders/<int:order_id>")
+@login_required
+def work_order_detail(order_id):
+    db = get_db()
+    order = db.execute("""SELECT w.*,e.code,e.name,e.criticality,u.full_name AS technician,creator.full_name AS creator,approver.full_name AS approver
+        FROM work_orders w JOIN equipment e ON e.id=w.equipment_id
+        LEFT JOIN users u ON u.id=w.assigned_to LEFT JOIN users creator ON creator.id=w.reported_by
+        LEFT JOIN users approver ON approver.id=w.approved_by WHERE w.id=?""",(order_id,)).fetchone()
+    if not order:
+        abort(404)
+    parts = db.execute("SELECT op.*,s.code,s.name FROM order_parts op JOIN spare_parts s ON s.id=op.spare_part_id WHERE op.work_order_id=?",(order_id,)).fetchall()
+    attachments = db.execute("SELECT * FROM attachments WHERE work_order_id=? ORDER BY id DESC",(order_id,)).fetchall()
+    spare_parts = db.execute("SELECT * FROM spare_parts ORDER BY name").fetchall()
+    return render_template("work_order_detail.html", order=order, parts=parts, attachments=attachments, spare_parts=spare_parts, statuses=ORDER_STATUSES)
+
+@app.route("/work-orders/<int:order_id>/update", methods=["POST"])
+@login_required
+def work_order_update(order_id):
+    db = get_db()
+    order = db.execute("SELECT * FROM work_orders WHERE id=?", (order_id,)).fetchone()
+    if not order:
+        abort(404)
+    user = current_user()
+    f = request.form
+    new_status = f.get("status", order["status"])
+    allowed = {"Pendiente","Asignada","En proceso","En revisión","Cerrada","Cancelada"}
+    if new_status not in allowed:
+        abort(400)
+    if user["role"] == "Supervisor de producción" and new_status not in ("Pendiente",):
+        abort(403)
+    if new_status == "Cerrada":
+        if user["role"] != "Encargado de mantenimiento":
+            flash("Solo el encargado de mantenimiento puede aprobar el cierre.", "error")
+            return redirect(url_for("work_order_detail", order_id=order_id))
+        if not f.get("resolution","").strip():
+            flash("Escribí la resolución antes de cerrar la orden.", "error")
+            return redirect(url_for("work_order_detail", order_id=order_id))
+        db.execute("""UPDATE work_orders SET status=?,resolution=?,labor_hours=?,labor_cost=?,parts_cost=?,completed_at=?,approved_by=?,approved_at=? WHERE id=?""",
+            (new_status,f.get("resolution","").strip(),float(f.get("labor_hours") or 0),float(f.get("labor_cost") or 0),
+             float(f.get("parts_cost") or 0),now_iso(),user["id"],now_iso(),order_id))
+        db.execute("UPDATE equipment SET status='Operativa' WHERE id=?", (order["equipment_id"],))
+    else:
+        started_at = order["started_at"]
+        if new_status == "En proceso" and not started_at:
+            started_at = now_iso()
+        db.execute("""UPDATE work_orders SET status=?,started_at=?,downtime_start=COALESCE(downtime_start,?),resolution=? WHERE id=?""",
+            (new_status,started_at,now_iso() if new_status=="En proceso" and order["maintenance_type"]=="Correctivo" else None,
+             f.get("resolution",order["resolution"] or ""),order_id))
+        if new_status == "En revisión":
+            db.execute("UPDATE work_orders SET downtime_end=? WHERE id=? AND downtime_start IS NOT NULL AND downtime_end IS NULL",(now_iso(),order_id))
+    db.commit()
+    flash("Orden de trabajo actualizada.", "success")
+    return redirect(url_for("work_order_detail", order_id=order_id))
+
+@app.route("/work-orders/<int:order_id>/parts", methods=["POST"])
+@login_required
+@roles_required("Encargado de mantenimiento","Técnico de mantenimiento")
+def add_part_to_order(order_id):
+    db = get_db()
+    order = db.execute("SELECT id FROM work_orders WHERE id=?", (order_id,)).fetchone()
+    if not order:
+        abort(404)
+    part_id = int(request.form.get("spare_part_id") or 0)
+    qty = int(request.form.get("quantity") or 0)
+    part = db.execute("SELECT * FROM spare_parts WHERE id=?", (part_id,)).fetchone()
+    if not part or qty <= 0:
+        flash("Seleccioná un repuesto y una cantidad válida.", "error")
+    elif part["quantity"] < qty:
+        flash("No hay existencias suficientes para esa cantidad.", "error")
+    else:
+        db.execute("UPDATE spare_parts SET quantity=quantity-? WHERE id=?", (qty,part_id))
+        db.execute("INSERT INTO order_parts(work_order_id,spare_part_id,quantity,unit_cost) VALUES(?,?,?,?)",
+            (order_id,part_id,qty,part["unit_cost"]))
+        db.execute("UPDATE work_orders SET parts_cost=parts_cost+? WHERE id=?", (qty*part["unit_cost"],order_id))
+        db.commit()
+        flash("Repuesto asociado a la orden y descontado del inventario.", "success")
+    return redirect(url_for("work_order_detail", order_id=order_id))
+
+@app.route("/work-orders/<int:order_id>/upload", methods=["POST"])
+@login_required
+def upload_attachment(order_id):
+    from werkzeug.utils import secure_filename
+    db = get_db()
+    order = db.execute("SELECT id FROM work_orders WHERE id=?", (order_id,)).fetchone()
+    if not order:
+        abort(404)
+    file = request.files.get("file")
+    if not file or not file.filename:
+        flash("Seleccioná un archivo.", "error")
+        return redirect(url_for("work_order_detail", order_id=order_id))
+    allowed = {".png",".jpg",".jpeg",".pdf",".doc",".docx"}
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in allowed:
+        flash("Formato no permitido. Usá PNG, JPG, PDF o DOC/DOCX.", "error")
+        return redirect(url_for("work_order_detail", order_id=order_id))
+    import uuid
+    stored = uuid.uuid4().hex + ext
+    upload_dir = os.path.join(DATA_DIR,"uploads")
+    os.makedirs(upload_dir,exist_ok=True)
+    file.save(os.path.join(upload_dir,stored))
+    db.execute("INSERT INTO attachments(work_order_id,original_name,stored_name,uploaded_by,created_at) VALUES(?,?,?,?,?)",
+        (order_id,secure_filename(file.filename),stored,session["user_id"],now_iso()))
+    db.commit()
+    flash("Evidencia cargada correctamente.", "success")
+    return redirect(url_for("work_order_detail", order_id=order_id))
+
+@app.route("/uploads/<stored_name>")
+@login_required
+def download_attachment(stored_name):
+    from flask import send_from_directory
+    return send_from_directory(os.path.join(DATA_DIR,"uploads"),stored_name,as_attachment=False)
+
+@app.route("/spare-parts")
+@login_required
+def spare_parts_list():
+    parts = get_db().execute("""SELECT s.*,e.name AS equipment_name FROM spare_parts s LEFT JOIN equipment e ON e.id=s.equipment_id ORDER BY s.name""").fetchall()
+    return render_template("spare_parts.html", parts=parts)
+
+@app.route("/spare-parts/new", methods=["GET", "POST"])
+@login_required
+@roles_required("Encargado de mantenimiento")
+def spare_part_new():
+    db = get_db()
+    equipment = db.execute("SELECT id,code,name FROM equipment ORDER BY name").fetchall()
+    if request.method == "POST":
+        f = request.form
+        try:
+            db.execute("""INSERT INTO spare_parts(code,name,equipment_id,quantity,minimum_quantity,unit_cost,location,created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                (f.get("code","").strip().upper(),f.get("name","").strip(),int(f.get("equipment_id") or 0) or None,
+                 int(f.get("quantity") or 0),int(f.get("minimum_quantity") or 0),float(f.get("unit_cost") or 0),
+                 f.get("location","").strip(),now_iso()))
+            db.commit()
+            flash("Repuesto registrado.", "success")
+            return redirect(url_for("spare_parts_list"))
+        except sqlite3.IntegrityError:
+            flash("El código de repuesto ya existe.", "error")
+    return render_template("spare_part_form.html", equipment=equipment)
+
+@app.route("/users")
+@login_required
+@roles_required("Encargado de mantenimiento")
+def users_list():
+    users = get_db().execute("SELECT * FROM users ORDER BY approved,id DESC").fetchall()
+    return render_template("users.html", users=users)
+
+@app.route("/users/<int:user_id>/approve", methods=["POST"])
+@login_required
+@roles_required("Encargado de mantenimiento")
+def approve_user(user_id):
+    get_db().execute("UPDATE users SET approved=1 WHERE id=?", (user_id,))
+    get_db().commit()
+    flash("Cuenta aprobada.", "success")
+    return redirect(url_for("users_list"))
+
+@app.route("/users/<int:user_id>/role", methods=["POST"])
+@login_required
+@roles_required("Encargado de mantenimiento")
+def change_role(user_id):
+    role = request.form.get("role")
+    if role not in ROLES:
+        abort(400)
+    get_db().execute("UPDATE users SET role=? WHERE id=?", (role,user_id))
+    get_db().commit()
+    flash("Rol actualizado.", "success")
+    return redirect(url_for("users_list"))
+
+@app.route("/reports")
+@login_required
+def reports():
+    db = get_db()
+    equipment = db.execute("""SELECT e.id,e.code,e.name,e.criticality,
+        COUNT(CASE WHEN w.maintenance_type='Correctivo' THEN 1 END) AS failures,
+        COALESCE(SUM(CASE WHEN w.status='Cerrada' THEN w.labor_cost+w.parts_cost ELSE 0 END),0) AS costs,
+        COALESCE(SUM(CASE WHEN w.downtime_start IS NOT NULL AND w.downtime_end IS NOT NULL
+            THEN (julianday(w.downtime_end)-julianday(w.downtime_start))*24 ELSE 0 END),0) AS downtime
+        FROM equipment e LEFT JOIN work_orders w ON w.equipment_id=e.id GROUP BY e.id ORDER BY failures DESC""").fetchall()
+    overdue = db.execute("""SELECT w.*,e.code,e.name FROM work_orders w JOIN equipment e ON e.id=w.equipment_id
+        WHERE w.scheduled_date < ? AND w.status NOT IN ('Cerrada','Cancelada') ORDER BY w.scheduled_date""",(date.today().isoformat(),)).fetchall()
+    history = db.execute("""SELECT w.*,e.code,e.name FROM work_orders w JOIN equipment e ON e.id=w.equipment_id ORDER BY w.created_at DESC LIMIT 100""").fetchall()
+    return render_template("reports.html", equipment=equipment, overdue=overdue, history=history)
+
+@app.route("/settings", methods=["GET", "POST"])
+@login_required
+@roles_required("Encargado de mantenimiento")
+def settings_page():
+    db = get_db()
+    if request.method == "POST":
+        f = request.form
+        for key in ("company_name","currency","timezone"):
+            db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key,f.get(key,"").strip()))
+        for metric in ("availability","preventive_compliance","corrective_percentage","monthly_downtime"):
+            try:
+                target = float(f.get("goal_"+metric) or 0)
+                db.execute("UPDATE goals SET target=? WHERE metric=?", (target,metric))
+            except ValueError:
+                pass
+        db.commit()
+        flash("Configuración guardada.", "success")
+        return redirect(url_for("settings_page"))
+    settings = {r["key"]:r["value"] for r in db.execute("SELECT key,value FROM settings")}
+    goals = {r["metric"]:r for r in db.execute("SELECT * FROM goals")}
+    return render_template("settings.html", settings=settings, goals=goals)
+
+@app.route("/seed-demo", methods=["POST"])
+@login_required
+@roles_required("Encargado de mantenimiento")
+def seed_demo():
+    db = get_db()
+    if db.execute("SELECT COUNT(*) FROM equipment").fetchone()[0] > 0:
+        flash("Ya existen máquinas. No se agregaron datos demo para evitar duplicados.", "error")
+        return redirect(url_for("settings_page"))
+    demo_equipment = [
+        ("SAM-001","Máquina Sambo","Máquina Sambo","Sambo","Modelo por confirmar","Costura","Crítica","Operativa",1200,30,"Equipo crítico; confirmar especificaciones con la ficha técnica."),
+        ("COS-001","Máquina de coser industrial 01","Máquina de coser industrial","Juki","DDL (referencial)","Costura","Alta","Operativa",850,30,"Datos de demostración."),
+        ("COR-001","Máquina de corte 01","Máquina de corte","Por registrar","","Corte","Alta","Operativa",600,30,"Datos de demostración."),
+        ("PLA-001","Plancha industrial 01","Plancha industrial","Por registrar","","Acabado","Media","Operativa",430,14,"Datos de demostración."),
+        ("OVL-001","Overlock 01","Overlock","Por registrar","","Costura","Alta","Operativa",720,30,"Datos de demostración."),
+        ("BOR-001","Bordadora 01","Bordadora","Por registrar","","Bordado","Media","Operativa",200,30,"Datos de demostración."),
+        ("SUB-001","Estampadora / sublimadora 01","Estampadora / sublimadora","Por registrar","","Estampado","Media","Operativa",250,30,"Datos de demostración."),
+    ]
+    for code,name,typ,brand,model,location,crit,status,hrs,interval,notes in demo_equipment:
+        db.execute("""INSERT INTO equipment(code,name,equipment_type,brand,model,location,criticality,status,operating_hours,maintenance_interval_days,notes,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",(code,name,typ,brand,model,location,crit,status,hrs,interval,notes,now_iso()))
+    ids = {r["code"]:r["id"] for r in db.execute("SELECT id,code FROM equipment")}
+    tech = db.execute("SELECT id FROM users WHERE role='Encargado de mantenimiento' LIMIT 1").fetchone()["id"]
+    samples = [
+        ("OT-DEMO-001","SAM-001","Preventivo","Inspección general de máquina Sambo","Revisar limpieza, lubricación y condición general.","Alta","Cerrada",-4,2.0,350,120),
+        ("OT-DEMO-002","COS-001","Correctivo","Ruido anormal en mecanismo","Ejemplo de registro de falla.","Alta","Pendiente",0,0,0,0),
+        ("OT-DEMO-003","OVL-001","Preventivo","Mantenimiento preventivo mensual","Limpiar y revisar elementos de desgaste.","Media","Asignada",3,0,0,0),
+    ]
+    for code,eqcode,typ,title,desc,priority,status,days,hours,labor,parts in samples:
+        scheduled = (date.today()+timedelta(days=days)).isoformat()
+        created = (datetime.now()-timedelta(days=max(1,abs(days)))).isoformat(timespec="minutes")
+        started = (datetime.now()-timedelta(days=max(1,abs(days)),hours=2)).isoformat(timespec="minutes") if status=="Cerrada" else None
+        completed = (datetime.now()-timedelta(days=max(1,abs(days)),hours=1)).isoformat(timespec="minutes") if status=="Cerrada" else None
+        db.execute("""INSERT INTO work_orders(order_code,equipment_id,maintenance_type,title,description,priority,status,assigned_to,reported_by,scheduled_date,started_at,completed_at,labor_hours,labor_cost,parts_cost,resolution,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (code,ids[eqcode],typ,title,desc,priority,status,tech,tech,scheduled,started,completed,hours,labor,parts,"Ejemplo de demostración" if status=="Cerrada" else "",created))
+    db.execute("UPDATE settings SET value='1' WHERE key='demo_mode'")
+    db.commit()
+    flash("Datos de demostración cargados. Están identificados como ejemplos; revisalos antes de usar la plataforma con datos reales.", "success")
+    return redirect(url_for("dashboard"))
+
+@app.route("/healthz")
+def healthz():
+    return {"status": "ok"}, 200
+
+@app.errorhandler(403)
+def forbidden(error):
+    return render_template("error.html", code=403, message="No tenés permisos para realizar esta acción."), 403
+
+@app.errorhandler(404)
+def not_found(error):
+    return render_template("error.html", code=404, message="No encontramos el recurso solicitado."), 404
+
+with app.app_context():
+    init_db()
+
+if __name__ == "__main__":
+    app.run(debug=os.environ.get("FLASK_DEBUG","0") == "1",
+            host=os.environ.get("HOST","127.0.0.1"), port=int(os.environ.get("PORT","5000")))

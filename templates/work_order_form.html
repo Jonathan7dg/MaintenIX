@@ -1,0 +1,11 @@
+{% extends "base.html" %}{% block title %}Nueva orden{% endblock %}{% block top_title %}Órdenes de trabajo{% endblock %}{% block content %}
+<div class="page-head"><div><h1>Nueva orden de trabajo</h1><p>Registrá una falla, mantenimiento programado o inspección.</p></div></div>
+<form method="post" class="form-card"><div class="form-grid">
+<div class="field"><label>Máquina *</label><select name="equipment_id" required>{% for e in equipment %}<option value="{{ e.id }}">{{ e.code }} · {{ e.name }}{% if e.criticality=='Crítica' %} — CRÍTICA{% endif %}</option>{% endfor %}</select></div>
+<div class="field"><label>Tipo de mantenimiento *</label><select name="maintenance_type">{% for t in maintenance_types %}<option {% if t=='Correctivo' %}selected{% endif %}>{{ t }}</option>{% endfor %}</select></div>
+<div class="field full"><label>Título *</label><input name="title" required placeholder="Ej. Ruido anormal en mecanismo"></div>
+<div class="field full"><label>Descripción / síntoma</label><textarea name="description" placeholder="Describí la falla, inspección o tarea solicitada."></textarea></div>
+<div class="field"><label>Prioridad</label><select name="priority">{% for p in priorities %}<option {% if p=='Media' %}selected{% endif %}>{{ p }}</option>{% endfor %}</select></div>
+<div class="field"><label>Asignar a</label><select name="assigned_to"><option value="">Sin asignar</option>{% for t in technicians %}<option value="{{ t.id }}">{{ t.full_name }}</option>{% endfor %}</select></div>
+<div class="field"><label>Fecha programada</label><input type="date" name="scheduled_date"></div>
+</div><div class="form-actions"><button>Crear orden</button><a class="btn secondary" href="{{ url_for('work_orders') }}">Cancelar</a></div></form>{% endblock %}

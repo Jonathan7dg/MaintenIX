@@ -1,0 +1,14 @@
+{% extends "base.html" %}{% block title %}{{ 'Editar máquina' if equipment else 'Registrar máquina' }}{% endblock %}{% block top_title %}Inventario de maquinaria{% endblock %}{% block content %}
+<div class="page-head"><div><h1>{{ 'Editar máquina' if equipment else 'Registrar máquina' }}</h1><p>Completá la ficha técnica y la información operativa del equipo.</p></div></div>
+<form method="post" class="form-card"><div class="form-grid">
+<div class="field"><label>Código único *</label><input name="code" required value="{{ equipment.code if equipment else '' }}" placeholder="Ej. SAM-001"></div>
+<div class="field"><label>Nombre del equipo *</label><input name="name" required value="{{ equipment.name if equipment else '' }}" placeholder="Ej. Máquina Sambo"></div>
+<div class="field"><label>Tipo de equipo</label><select name="equipment_type">{% for t in equipment_types %}<option {% if equipment and equipment.equipment_type==t %}selected{% elif not equipment and t=='Máquina Sambo' %}selected{% endif %}>{{ t }}</option>{% endfor %}</select></div>
+<div class="field"><label>Criticidad</label><select name="criticality">{% for v in ['Baja','Media','Alta','Crítica'] %}<option {% if equipment and equipment.criticality==v or not equipment and v=='Media' %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>
+<div class="field"><label>Marca</label><input name="brand" value="{{ equipment.brand if equipment else '' }}"></div>
+<div class="field"><label>Modelo</label><input name="model" value="{{ equipment.model if equipment else '' }}"></div>
+<div class="field"><label>Ubicación / área</label><input name="location" value="{{ equipment.location if equipment else '' }}" placeholder="Ej. Costura"></div>
+<div class="field"><label>Estado</label><select name="status">{% for v in ['Operativa','En mantenimiento','Fuera de servicio','Retirada'] %}<option {% if equipment and equipment.status==v or not equipment and v=='Operativa' %}selected{% endif %}>{{ v }}</option>{% endfor %}</select></div>
+<div class="field"><label>Horas de operación acumuladas</label><input type="number" step="0.1" min="0" name="operating_hours" value="{{ equipment.operating_hours if equipment else 0 }}"></div>
+<div class="field"><label>Frecuencia preventiva (días)</label><input type="number" min="1" name="maintenance_interval_days" value="{{ equipment.maintenance_interval_days if equipment and equipment.maintenance_interval_days else '' }}" placeholder="Por definir"></div>
+<div class="field full"><label>Notas técnicas</label><textarea name="notes" placeholder="Recomendaciones del fabricante, especificaciones por confirmar, etc.">{{ equipment.notes if equipment else '' }}</textarea></div></div><div class="form-actions"><button type="submit">Guardar máquina</button><a class="btn secondary" href="{{ url_for('equipment_list') }}">Cancelar</a></div></form>{% endblock %}

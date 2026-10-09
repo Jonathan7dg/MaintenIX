@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="es">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{% block title %}MaintenIX{% endblock %} · MaintenIX</title><link rel="stylesheet" href="{{ url_for('static',filename='css/app.css') }}"></head>
+<body>
+{% if current_user %}
+<div class="layout">
+<aside class="sidebar">
+  <div class="brand"><div class="brand-mark">M</div><div class="brand-copy"><strong>MaintenIX</strong><small>Mantenimiento inteligente</small></div></div>
+  <div class="nav-label">Principal</div>
+  <a class="nav-link {% if request.endpoint=='dashboard' %}active{% endif %}" href="{{ url_for('dashboard') }}"><span class="nav-icon">▦</span><span class="nav-text">Dashboard</span></a>
+  <a class="nav-link {% if request.endpoint and request.endpoint.startswith('equipment') %}active{% endif %}" href="{{ url_for('equipment_list') }}"><span class="nav-icon">⚙</span><span class="nav-text">Maquinaria</span></a>
+  <a class="nav-link {% if request.endpoint and request.endpoint.startswith('work_order') or request.endpoint=='work_orders' %}active{% endif %}" href="{{ url_for('work_orders') }}"><span class="nav-icon">▤</span><span class="nav-text">Órdenes de trabajo</span></a>
+  <a class="nav-link {% if request.endpoint and request.endpoint.startswith('spare') %}active{% endif %}" href="{{ url_for('spare_parts_list') }}"><span class="nav-icon">◈</span><span class="nav-text">Repuestos</span></a>
+  <div class="nav-label">Análisis</div>
+  <a class="nav-link {% if request.endpoint=='reports' %}active{% endif %}" href="{{ url_for('reports') }}"><span class="nav-icon">▥</span><span class="nav-text">Reportes</span></a>
+  {% if current_user.role == 'Encargado de mantenimiento' %}
+  <div class="nav-label">Administración</div>
+  <a class="nav-link {% if request.endpoint=='users_list' %}active{% endif %}" href="{{ url_for('users_list') }}"><span class="nav-icon">♙</span><span class="nav-text">Usuarios y permisos</span></a>
+  <a class="nav-link {% if request.endpoint=='settings_page' %}active{% endif %}" href="{{ url_for('settings_page') }}"><span class="nav-icon">⚙</span><span class="nav-text">Configuración</span></a>
+  {% endif %}
+  <div class="sidebar-bottom">Mi Ropa Favorita<br>Versión inicial · Local</div>
+</aside>
+<main class="main">
+<header class="topbar">
+  <div><div class="top-title">{% block top_title %}Centro de control{% endblock %}</div><div class="top-sub">{{ settings.get('company_name','Mi Ropa Favorita') }} · Mantenimiento industrial</div></div>
+  <div class="top-right"><button class="btn secondary small" data-theme-toggle title="Cambiar tema">◐ <span class="nav-text">Tema</span></button><div class="avatar">{{ current_user.full_name[:1]|upper }}</div><div class="user-meta">{{ current_user.full_name }}<small>{{ current_user.role }}</small></div><a class="btn secondary small" href="{{ url_for('logout') }}">Salir</a></div>
+</header>
+<div class="flash-wrap">{% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="flash {{ 'error' if category=='error' else '' }}">{{ message }}</div>{% endfor %}{% endwith %}</div>
+<div class="content">{% block content %}{% endblock %}<div class="footer-note">MaintenIX · Los indicadores dependen de que los registros de fallas, tiempos y costos estén completos. Las evidencias de esta versión se guardan localmente.</div></div>
+</main></div>
+{% else %}
+{% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="flash {{ 'error' if category=='error' else '' }}" style="position:fixed;top:10px;left:10px;right:10px;z-index:2">{{ message }}</div>{% endfor %}{% endwith %}
+{% block auth_content %}{% endblock %}
+{% endif %}
+<script src="{{ url_for('static',filename='js/app.js') }}"></script></body></html>
